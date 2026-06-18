@@ -1,19 +1,89 @@
 /**
  * ============================================================
  * EMAIL FOLLOWUP DIGEST
- * Project: Email Followup Digest
- * Author: Butler Leather - PMO
- * Description: Scans sent emails, detects non-replies,
- *              categorizes by days elapsed, updates sheet.
+ * Project : Email Followup Digest
+ * Author  : Butler Leather - PMO
+ * Version : 2.0
+ * Description:
+ *   Scans sent emails, detects non-replies,
+ *   categorizes by days elapsed, updates sheet.
+ *   Includes authorization check, sheet protection,
+ *   web app (doGet) support.
  * ============================================================
  */
 
 // ─────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────
-var SHEET_DIGEST = 'Digest';
-var SHEET_CONFIG = 'Config';
-var DATA_START_ROW = 4; // Row 1: Last Updated, Row 2: Blank, Row 3: Headers, Row 4: Data
+var SHEET_DIGEST   = 'Digest';
+var SHEET_CONFIG   = 'Config';
+var DATA_START_ROW = 4; // Row 1: Meta, Row 2: Blank, Row 3: Headers, Row 4: Data
+
+// ─────────────────────────────────────────────
+// WEB APP ENTRY POINT — doGet
+// Execute as: PMO (pmo@butlerleather.com)
+// Access: Anyone in organisation
+// ─────────────────────────────────────────────
+function doGet(e) {
+  try {
+    Logger.log('doGet called.');
+
+    // Authorization check — reads sender email from Config (not hardcoded)
+    var authResult = checkAuthorization();
+    if (!authResult.authorized) {
+      return ContentService
+        .createTextOutput(JSON.stringify({ status: 'error', message: authResult.message }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // Run core digest logic
+    runFollowupDigest();
+
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: 'success', message: 'Followup Digest refreshed successfully.' }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (e) {
+    Logger.log('doGet ERROR: ' + e.message);
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: 'error', message: e.message }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// ─────────────────────────────────────────────
+// AUTHORIZATION CHECK
+// Reads sender email from Config — no hardcoding
+// PMO = sender email in config → always runs
+// Other user = must match sender email → runs
+// No match → UI Alert — not authorized
+// ─────────────────────────────────────────────
+function checkAuthorization() {
+  try {
+    var ss         = SpreadsheetApp.getActiveSpreadsheet();
+    var config     = readConfig(ss);
+    var senderEmail = config.senderEmail.toLowerCase().trim();
+    var currentUser = Session.getActiveUser().getEmail().toLowerCase().trim();
+
+    Logger.log('Auth check — Current user: ' + currentUser + ' | Sender email: ' + senderEmail);
+
+    if (currentUser === senderEmail) {
+      Logger.log('Authorization passed.');
+      return { authorized: true };
+    }
+
+    // Not authorized
+    Logger.log('Authorization FAILED for: ' + currentUser);
+    return {
+      authorized : false,
+      message    : 'You are not authorized to run this script.\n\nYour email: ' + currentUser + '\nAuthorized email: ' + senderEmail
+    };
+
+  } catch (e) {
+    Logger.log('checkAuthorization ERROR: ' + e.message);
+    return { authorized: false, message: 'Authorization check failed: ' + e.message };
+  }
+}
 
 // ─────────────────────────────────────────────
 // ON OPEN — Add Custom Menu
@@ -22,12 +92,15 @@ function onOpen() {
   try {
     SpreadsheetApp.getUi()
       .createMenu('📋 Followup Digest')
-      .addItem('🔄 Refresh Now', 'runFollowupDigest')
+      .addItem('🔄 Refresh Now',        'menuRefreshNow')
       .addSeparator()
-      .addItem('ℹ️ Show Last Updated', 'showLastUpdated')
+      .addItem('ℹ️ Show Last Updated',  'menuShowLastUpdated')
       .addSeparator()
-      .addItem('⚙️ Setup Daily Trigger', 'setupDailyTrigger')
-      .addItem('🗑️ Remove Daily Trigger', 'removeDailyTrigger')
+      .addItem('⚙️ Setup Daily Trigger','menuSetupTrigger')
+      .addItem('🗑️ Remove Daily Trigger','menuRemoveTrigger')
+      .addSeparator()
+      .addItem('🔒 Protect Sheet',      'menuProtectSheet')
+      .addItem('🔓 Remove Protection',  'menuRemoveProtection')
       .addToUi();
     Logger.log('Menu created successfully.');
   } catch (e) {
@@ -36,7 +109,156 @@ function onOpen() {
 }
 
 // ─────────────────────────────────────────────
+// MENU WRAPPERS — All menu buttons go through
+// authorization check first before executing
+// ─────────────────────────────────────────────
+function menuRefreshNow() {
+  if (!isAuthorizedWithAlert()) return;
+  runFollowupDigest();
+}
+
+function menuShowLastUpdated() {
+  if (!isAuthorizedWithAlert()) return;
+  showLastUpdated();
+}
+
+function menuSetupTrigger() {
+  if (!isAuthorizedWithAlert()) return;
+  setupDailyTrigger();
+}
+
+function menuRemoveTrigger() {
+  if (!isAuthorizedWithAlert()) return;
+  removeDailyTrigger();
+}
+
+function menuProtectSheet() {
+  if (!isAuthorizedWithAlert()) return;
+  protectSheet();
+}
+
+function menuRemoveProtection() {
+  if (!isAuthorizedWithAlert()) return;
+  removeSheetProtection();
+}
+
+// ─────────────────────────────────────────────
+// IS AUTHORIZED WITH ALERT
+// Called by all menu wrappers
+// Shows UI Alert (not toast) if not authorized
+// Returns true/false for flow control
+// ─────────────────────────────────────────────
+function isAuthorizedWithAlert() {
+  try {
+    var authResult = checkAuthorization();
+    if (!authResult.authorized) {
+      // UI Alert — not toast as required
+      SpreadsheetApp.getUi().alert(
+        '🚫 Not Authorized',
+        authResult.message,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+      return false;
+    }
+    return true;
+  } catch (e) {
+    Logger.log('isAuthorizedWithAlert ERROR: ' + e.message);
+    SpreadsheetApp.getUi().alert(
+      '❌ Error',
+      'Authorization check failed: ' + e.message,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────
+// SHEET PROTECTION
+// Locks Digest & Config sheets
+// Only script (PMO) can edit
+// All other users — view only
+// ─────────────────────────────────────────────
+function protectSheet() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var config = readConfig(ss);
+    var senderEmail = config.senderEmail.trim();
+
+    var sheetsToProtect = [SHEET_DIGEST, SHEET_CONFIG];
+
+    sheetsToProtect.forEach(function(sheetName) {
+      var sheet = ss.getSheetByName(sheetName);
+      if (!sheet) return;
+
+      // Remove existing protections first
+      var existingProtections = sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+      existingProtections.forEach(function(p) { p.remove(); });
+
+      // Apply new protection
+      var protection = sheet.protect();
+      protection.setDescription('Protected by Email Followup Digest Script');
+
+      // Remove all editors except PMO (sender email from config)
+      protection.removeEditors(protection.getEditors());
+      protection.addEditor(senderEmail);
+
+      // Allow script owner always
+      if (protection.canDomainEdit()) {
+        protection.setDomainEdit(false);
+      }
+
+      Logger.log('Sheet protected: ' + sheetName);
+    });
+
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      'Digest & Config sheets are now protected.',
+      '🔒 Sheet Protection Applied', 5
+    );
+
+  } catch (e) {
+    Logger.log('protectSheet ERROR: ' + e.message);
+    SpreadsheetApp.getUi().alert(
+      '❌ Protection Error',
+      e.message,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// REMOVE SHEET PROTECTION
+// ─────────────────────────────────────────────
+function removeSheetProtection() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheetsToUnprotect = [SHEET_DIGEST, SHEET_CONFIG];
+
+    sheetsToUnprotect.forEach(function(sheetName) {
+      var sheet = ss.getSheetByName(sheetName);
+      if (!sheet) return;
+      var protections = sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET);
+      protections.forEach(function(p) { p.remove(); });
+      Logger.log('Protection removed: ' + sheetName);
+    });
+
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      'Sheet protection removed.',
+      '🔓 Protection Removed', 5
+    );
+
+  } catch (e) {
+    Logger.log('removeSheetProtection ERROR: ' + e.message);
+    SpreadsheetApp.getUi().alert(
+      '❌ Remove Protection Error',
+      e.message,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
 // MAIN FUNCTION — Run Followup Digest
+// Core logic — untouched
 // ─────────────────────────────────────────────
 function runFollowupDigest() {
   try {
@@ -65,24 +287,26 @@ function runFollowupDigest() {
     Logger.log('Pending threads (no reply): ' + rows.length);
 
     // Step 6: Sort by Days Elapsed Descending
-    rows.sort(function(a, b) { return b[headerMap['Days Elapsed']] - a[headerMap['Days Elapsed']]; });
+    rows.sort(function(a, b) {
+      return b['Days Elapsed'] - a['Days Elapsed'];
+    });
 
     // Step 7: Write to Sheet in Bulk
-    writeToSheet(digestSheet, rows, headerMap, config);
+    writeToSheet(digestSheet, rows, headerMap);
 
     // Step 8: Update Last Updated & Total Pending
     updateMetaRow(digestSheet, rows.length);
 
     Logger.log('=== Email Followup Digest Completed ===');
     SpreadsheetApp.getActiveSpreadsheet().toast(
-      'Found ' + rows.length + ' pending emails.', 
+      'Found ' + rows.length + ' pending emails.',
       '✅ Followup Digest Refreshed', 5
     );
 
   } catch (e) {
     Logger.log('runFollowupDigest ERROR: ' + e.message);
     SpreadsheetApp.getActiveSpreadsheet().toast(
-      'Error: ' + e.message, 
+      'Error: ' + e.message,
       '❌ Followup Digest Failed', 10
     );
   }
@@ -90,6 +314,7 @@ function runFollowupDigest() {
 
 // ─────────────────────────────────────────────
 // READ CONFIG TAB — Header Name Based Mapping
+// Single API call — reads all config at once
 // ─────────────────────────────────────────────
 function readConfig(ss) {
   try {
@@ -99,40 +324,30 @@ function readConfig(ss) {
     // Read all config data at once — single API call
     var data = configSheet.getDataRange().getValues();
 
-    // Build key-value map from config sheet (Col A = Setting, Col B = Value)
+    // Build key-value map (Col A = Setting, Col B = Value)
     var configMap = {};
     for (var i = 1; i < data.length; i++) {
-      var key = String(data[i][0]).trim();
+      var key   = String(data[i][0]).trim();
       var value = String(data[i][1]).trim();
       if (key) configMap[key] = value;
     }
 
-    // Parse category ranges from config
     var config = {
-      scanWindow    : parseInt(configMap['Scan Window (days)']) || 30,
-      triggerTime   : configMap['Trigger Time'] || '8:00 AM',
-      senderEmail   : configMap['Sender Email'] || Session.getActiveUser().getEmail(),
-      freshMin      : 1,
-      freshMax      : 2,
-      followupMin   : 3,
-      followupMax   : 5,
-      urgentMin     : 6,
-      urgentMax     : 10,
-      criticalMin   : 11,
-      criticalMax   : 20,
-      deadMin       : 21
+      scanWindow  : parseInt(configMap['Scan Window (days)']) || 30,
+      triggerTime : configMap['Trigger Time']  || '8:00 AM',
+      senderEmail : configMap['Sender Email']  || Session.getActiveUser().getEmail(),
+      freshMin    : 1,
+      freshMax    : parseRangeMax(configMap['Fresh Range'], 2),
+      followupMax : parseRangeMax(configMap['Followup Range'], 5),
+      urgentMax   : parseRangeMax(configMap['Urgent Range'], 10),
+      criticalMax : parseRangeMax(configMap['Critical Range'], 20)
     };
 
-    // Parse ranges dynamically from config
-    config.freshMax    = parseRangeMax(configMap['Fresh Range'], 2);
-    config.followupMax = parseRangeMax(configMap['Followup Range'], 5);
-    config.urgentMax   = parseRangeMax(configMap['Urgent Range'], 10);
-    config.criticalMax = parseRangeMax(configMap['Critical Range'], 20);
-
-    config.followupMin  = config.freshMax + 1;
-    config.urgentMin    = config.followupMax + 1;
-    config.criticalMin  = config.urgentMax + 1;
-    config.deadMin      = config.criticalMax + 1;
+    // Derive min values from max values — consistent range boundaries
+    config.followupMin = config.freshMax    + 1;
+    config.urgentMin   = config.followupMax + 1;
+    config.criticalMin = config.urgentMax   + 1;
+    config.deadMin     = config.criticalMax + 1;
 
     return config;
 
@@ -159,6 +374,7 @@ function parseRangeMax(rangeStr, defaultVal) {
 
 // ─────────────────────────────────────────────
 // GET HEADER MAP — Column Name → Index (0-based)
+// No hardcoded column positions
 // ─────────────────────────────────────────────
 function getHeaderMap(digestSheet) {
   try {
@@ -177,29 +393,26 @@ function getHeaderMap(digestSheet) {
 
 // ─────────────────────────────────────────────
 // FETCH SENT THREADS — Bulk Gmail API Call
+// Paginated in batches of 100
 // ─────────────────────────────────────────────
 function fetchSentThreads(scanWindowDays, senderEmail) {
   try {
     var cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - scanWindowDays);
 
-    // Format date for Gmail search query
     var formattedDate = Utilities.formatDate(cutoffDate, Session.getScriptTimeZone(), 'yyyy/MM/dd');
-
-    // Single Gmail search query — bulk fetch
     var query = 'in:sent from:' + senderEmail + ' after:' + formattedDate;
     Logger.log('Gmail Query: ' + query);
 
-    var threads = [];
-    var start = 0;
-    var batchSize = 100; // Gmail API max per call
+    var threads   = [];
+    var start     = 0;
+    var batchSize = 100;
 
-    // Paginate through results in batches
     while (true) {
       var batch = GmailApp.search(query, start, batchSize);
       if (!batch || batch.length === 0) break;
       threads = threads.concat(batch);
-      Logger.log('Fetched batch: ' + batch.length + ' threads (total: ' + threads.length + ')');
+      Logger.log('Fetched batch: ' + batch.length + ' | Total: ' + threads.length);
       if (batch.length < batchSize) break;
       start += batchSize;
     }
@@ -213,79 +426,68 @@ function fetchSentThreads(scanWindowDays, senderEmail) {
 }
 
 // ─────────────────────────────────────────────
-// PROCESS THREADS — Filter No-Reply & Categorize
-// FIX 1: Check LAST message sender (not any message)
+// PROCESS THREADS — Core Logic (untouched)
+// FIX 1: Check LAST message sender in full thread
 // FIX 2: Days elapsed from YOUR last sent date
 // ─────────────────────────────────────────────
 function processThreads(threads, config) {
   try {
-    var today = new Date();
+    var today          = new Date();
     today.setHours(0, 0, 0, 0);
-    var rows = [];
+    var rows           = [];
     var senderEmailLower = config.senderEmail.toLowerCase();
 
     for (var i = 0; i < threads.length; i++) {
       var thread = threads[i];
 
       try {
-        // Get FULL thread messages — both sent & received
+        // Get FULL thread — both sent & received messages
         var messages = thread.getMessages();
         if (!messages || messages.length === 0) continue;
 
-        // ── FIX 1: Check LAST message sender ──────────────────
-        // Last message tells us who the ball is with right now
-        var lastMessage = messages[messages.length - 1];
+        // ── FIX 1: Check LAST message sender ──────────────
+        // Last message = who has the ball right now
+        var lastMessage   = messages[messages.length - 1];
         var lastMsgSender = lastMessage.getFrom().toLowerCase();
 
-        // If last message is NOT from sender → supplier replied last
-        // → No action needed → Skip this thread
+        // Last msg NOT from sender → supplier replied last → skip
         if (lastMsgSender.indexOf(senderEmailLower) === -1) continue;
 
-        // ── FIX 2: Days elapsed from YOUR last sent date ───────
-        // Find the LAST message sent BY sender (not first)
-        // Because supplier clock resets every time you send new message
+        // ── FIX 2: Days elapsed from YOUR last sent date ──
+        // Clock resets every time sender sends a new message
         var lastSentByUs = null;
         for (var m = messages.length - 1; m >= 0; m--) {
-          var fromEmail = messages[m].getFrom().toLowerCase();
-          if (fromEmail.indexOf(senderEmailLower) !== -1) {
+          if (messages[m].getFrom().toLowerCase().indexOf(senderEmailLower) !== -1) {
             lastSentByUs = messages[m];
             break;
           }
         }
         if (!lastSentByUs) continue;
 
-        // Calculate days elapsed from YOUR last sent date
         var lastSentDate = lastSentByUs.getDate();
         lastSentDate.setHours(0, 0, 0, 0);
         var daysElapsed = Math.floor((today - lastSentDate) / (1000 * 60 * 60 * 24));
 
-        // Skip if sent today (0 days)
+        // Skip if sent today
         if (daysElapsed < 1) continue;
 
-        // Get recipient from first sent message by us
+        // Get first sent message for recipient details
         var firstSentByUs = null;
         for (var m = 0; m < messages.length; m++) {
-          var fromEmail = messages[m].getFrom().toLowerCase();
-          if (fromEmail.indexOf(senderEmailLower) !== -1) {
+          if (messages[m].getFrom().toLowerCase().indexOf(senderEmailLower) !== -1) {
             firstSentByUs = messages[m];
             break;
           }
         }
         if (!firstSentByUs) continue;
 
-        // Assign category based on days elapsed
-        var category = assignCategory(daysElapsed, config);
-
-        // Get recipient details from first sent message
-        var toField = firstSentByUs.getTo();
+        var category       = assignCategory(daysElapsed, config);
+        var toField        = firstSentByUs.getTo();
         var recipientEmail = extractEmail(toField);
-        var recipientName = extractName(toField);
+        var recipientName  = extractName(toField);
+        var gmailLink      = 'https://mail.google.com/mail/u/0/#all/' + thread.getId();
 
-        // Build Gmail thread link
-        var gmailLink = 'https://mail.google.com/mail/u/0/#all/' + thread.getId();
-
-        // Build row as object — header name based
-        var row = {
+        rows.push({
           'Recipient'      : recipientEmail,
           'Recipient Name' : recipientName,
           'Subject'        : thread.getFirstMessageSubject(),
@@ -293,12 +495,10 @@ function processThreads(threads, config) {
           'Days Elapsed'   : daysElapsed,
           'Category'       : category,
           'Gmail Link'     : gmailLink
-        };
-
-        rows.push(row);
+        });
 
       } catch (threadErr) {
-        Logger.log('Thread processing error (skipped): ' + threadErr.message);
+        Logger.log('Thread skipped: ' + threadErr.message);
         continue;
       }
     }
@@ -313,26 +513,28 @@ function processThreads(threads, config) {
 
 // ─────────────────────────────────────────────
 // ASSIGN CATEGORY — Based on Days Elapsed
+// Reads boundaries from config dynamically
 // ─────────────────────────────────────────────
 function assignCategory(days, config) {
-  if (days >= config.freshMin && days <= config.freshMax)       return '🟢 Fresh';
-  if (days >= config.followupMin && days <= config.followupMax) return '🟡 Followup';
-  if (days >= config.urgentMin && days <= config.urgentMax)     return '🔴 Urgent';
-  if (days >= config.criticalMin && days <= config.criticalMax) return '🚨 Critical';
-  if (days >= config.deadMin)                                    return '💀 Dead';
-  return '🟢 Fresh';
+  if (days >= config.freshMin    && days <= config.freshMax)    return 'Fresh';
+  if (days >= config.followupMin && days <= config.followupMax) return 'Followup';
+  if (days >= config.urgentMin   && days <= config.urgentMax)   return 'Urgent';
+  if (days >= config.criticalMin && days <= config.criticalMax) return 'Critical';
+  if (days >= config.deadMin)                                    return 'Dead';
+  return 'Fresh';
 }
 
 // ─────────────────────────────────────────────
 // WRITE TO SHEET — Bulk setValues() Single Call
 // ─────────────────────────────────────────────
-function writeToSheet(digestSheet, rows, headerMap, config) {
+function writeToSheet(digestSheet, rows, headerMap) {
   try {
-    // Clear existing data rows only (keep header rows 1-3)
+    // Clear data rows only — keep rows 1, 2, 3
     var lastRow = digestSheet.getLastRow();
     if (lastRow >= DATA_START_ROW) {
-      digestSheet.getRange(DATA_START_ROW, 1, lastRow - DATA_START_ROW + 1, digestSheet.getLastColumn()).clearContent();
-      digestSheet.getRange(DATA_START_ROW, 1, lastRow - DATA_START_ROW + 1, digestSheet.getLastColumn()).clearFormat();
+      var clearRange = digestSheet.getRange(DATA_START_ROW, 1, lastRow - DATA_START_ROW + 1, digestSheet.getLastColumn());
+      clearRange.clearContent();
+      clearRange.clearFormat();
     }
 
     if (rows.length === 0) {
@@ -340,40 +542,36 @@ function writeToSheet(digestSheet, rows, headerMap, config) {
       return;
     }
 
-    // Get ordered column names from header map
-    var colCount = Object.keys(headerMap).length;
+    // Build ordered header array from header map
+    var colCount       = Object.keys(headerMap).length;
     var orderedHeaders = new Array(colCount);
     for (var key in headerMap) {
       orderedHeaders[headerMap[key]] = key;
     }
 
-    // Build 2D array for bulk write — single setValues() call
+    // Build 2D array — single bulk setValues() call
     var outputData = [];
     for (var i = 0; i < rows.length; i++) {
-      var row = rows[i];
+      var row      = rows[i];
       var rowArray = new Array(colCount).fill('');
       for (var j = 0; j < orderedHeaders.length; j++) {
         var colName = orderedHeaders[j];
         if (colName && row.hasOwnProperty(colName)) {
-          // Gmail Link column — set as hyperlink formula
-          if (colName === 'Gmail Link') {
-            rowArray[j] = '=HYPERLINK("' + row[colName] + '","🔗 Open Mail")';
-          } else {
-            rowArray[j] = row[colName];
-          }
+          rowArray[j] = (colName === 'Gmail Link')
+            ? '=HYPERLINK("' + row[colName] + '","🔗 Open Mail")'
+            : row[colName];
         }
       }
       outputData.push(rowArray);
     }
 
     // Single bulk write — fastest approach
-    var writeRange = digestSheet.getRange(DATA_START_ROW, 1, outputData.length, colCount);
-    writeRange.setValues(outputData);
+    digestSheet.getRange(DATA_START_ROW, 1, outputData.length, colCount).setValues(outputData);
 
     // Apply category color formatting in bulk
     applyCategoryFormatting(digestSheet, rows, headerMap, DATA_START_ROW);
 
-    Logger.log('Sheet written successfully: ' + rows.length + ' rows.');
+    Logger.log('Sheet written: ' + rows.length + ' rows.');
 
   } catch (e) {
     Logger.log('writeToSheet ERROR: ' + e.message);
@@ -382,22 +580,19 @@ function writeToSheet(digestSheet, rows, headerMap, config) {
 }
 
 // ─────────────────────────────────────────────
-// APPLY CATEGORY FORMATTING — Color Code Rows
+// APPLY CATEGORY FORMATTING — Bulk Color Coding
+// Text only — no emoji in category (consistent)
 // ─────────────────────────────────────────────
 function applyCategoryFormatting(digestSheet, rows, headerMap, startRow) {
   try {
-    var categoryColIndex = headerMap['Category'];
-    if (categoryColIndex === undefined) return;
-
     var totalCols = Object.keys(headerMap).length;
 
-    // Group rows by category for bulk formatting
     var categoryGroups = {
-      '🟢 Fresh'    : { color: '#E6F4EA', rows: [] },
-      '🟡 Followup' : { color: '#FFF9C4', rows: [] },
-      '🔴 Urgent'   : { color: '#FFE0B2', rows: [] },
-      '🚨 Critical' : { color: '#FFCDD2', rows: [] },
-      '💀 Dead'     : { color: '#EEEEEE', rows: [] }
+      'Fresh'    : { color: '#E6F4EA', rows: [] }, // Light Green
+      'Followup' : { color: '#FFF9C4', rows: [] }, // Light Yellow
+      'Urgent'   : { color: '#FFE0B2', rows: [] }, // Light Orange
+      'Critical' : { color: '#FFCDD2', rows: [] }, // Light Red
+      'Dead'     : { color: '#EEEEEE', rows: [] }  // Grey
     };
 
     for (var i = 0; i < rows.length; i++) {
@@ -407,12 +602,11 @@ function applyCategoryFormatting(digestSheet, rows, headerMap, startRow) {
       }
     }
 
-    // Apply formatting per category group
+    // Bulk apply per category group
     for (var cat in categoryGroups) {
       var group = categoryGroups[cat];
       for (var r = 0; r < group.rows.length; r++) {
-        digestSheet.getRange(group.rows[r], 1, 1, totalCols)
-          .setBackground(group.color);
+        digestSheet.getRange(group.rows[r], 1, 1, totalCols).setBackground(group.color);
       }
     }
 
@@ -428,22 +622,13 @@ function applyCategoryFormatting(digestSheet, rows, headerMap, startRow) {
 // ─────────────────────────────────────────────
 function updateMetaRow(digestSheet, totalPending) {
   try {
-    var now = new Date();
+    var now          = new Date();
     var formattedNow = Utilities.formatDate(now, Session.getScriptTimeZone(), 'dd-MMM-yyyy hh:mm a');
 
-    // Read header map to find correct columns
-    var headerRow = digestSheet.getRange(3, 1, 1, digestSheet.getLastColumn()).getValues()[0];
-    var totalCols = headerRow.length;
-
-    // Set Last Updated in A1
-    digestSheet.getRange(1, 1).setValue('Last Updated:');
+    digestSheet.getRange(1, 1).setValue('Last Updated:').setFontWeight('bold');
     digestSheet.getRange(1, 2).setValue(formattedNow);
-    digestSheet.getRange(1, 1).setFontWeight('bold');
-
-    // Set Total Pending — find column C & D position
-    digestSheet.getRange(1, 3).setValue('Total Pending:');
+    digestSheet.getRange(1, 3).setValue('Total Pending:').setFontWeight('bold');
     digestSheet.getRange(1, 4).setValue(totalPending);
-    digestSheet.getRange(1, 3).setFontWeight('bold');
 
     Logger.log('Meta row updated: ' + formattedNow + ' | Pending: ' + totalPending);
 
@@ -453,18 +638,18 @@ function updateMetaRow(digestSheet, totalPending) {
 }
 
 // ─────────────────────────────────────────────
-// SHOW LAST UPDATED — Menu Info Item
+// SHOW LAST UPDATED — UI Alert
 // ─────────────────────────────────────────────
 function showLastUpdated() {
   try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var ss          = SpreadsheetApp.getActiveSpreadsheet();
     var digestSheet = ss.getSheetByName(SHEET_DIGEST);
     var lastUpdated = digestSheet.getRange(1, 2).getValue();
-    var totalPending = digestSheet.getRange(1, 4).getValue();
+    var total       = digestSheet.getRange(1, 4).getValue();
 
     SpreadsheetApp.getUi().alert(
       'Email Followup Digest',
-      '🕒 Last Updated: ' + lastUpdated + '\n📋 Total Pending: ' + totalPending,
+      '🕒 Last Updated : ' + lastUpdated + '\n📋 Total Pending : ' + total,
       SpreadsheetApp.getUi().ButtonSet.OK
     );
   } catch (e) {
@@ -473,20 +658,18 @@ function showLastUpdated() {
 }
 
 // ─────────────────────────────────────────────
-// SETUP DAILY TRIGGER — 8:00 AM
+// SETUP DAILY TRIGGER — Reads time from Config
+// Removes existing before creating — no duplicates
 // ─────────────────────────────────────────────
 function setupDailyTrigger() {
   try {
-    // Remove existing triggers first to avoid duplicates
-    removeDailyTrigger();
+    removeDailyTrigger(); // Always remove first — prevent duplicates
 
-    // Read trigger time from config
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var config = readConfig(ss);
-    var triggerHour = 8; // Default 8 AM
+    var ss          = SpreadsheetApp.getActiveSpreadsheet();
+    var config      = readConfig(ss);
+    var triggerHour = 8;
 
-    // Parse hour from config trigger time (e.g. "8:00 AM" → 8)
-    var timeStr = config.triggerTime || '8:00 AM';
+    var timeStr  = config.triggerTime || '8:00 AM';
     var timeParts = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
     if (timeParts) {
       triggerHour = parseInt(timeParts[1]);
@@ -508,15 +691,12 @@ function setupDailyTrigger() {
 
   } catch (e) {
     Logger.log('setupDailyTrigger ERROR: ' + e.message);
-    SpreadsheetApp.getActiveSpreadsheet().toast(
-      'Error: ' + e.message,
-      '❌ Trigger Setup Failed', 10
-    );
+    SpreadsheetApp.getUi().alert('❌ Trigger Error', e.message, SpreadsheetApp.getUi().ButtonSet.OK);
   }
 }
 
 // ─────────────────────────────────────────────
-// REMOVE DAILY TRIGGER
+// REMOVE DAILY TRIGGER — Safe removal
 // ─────────────────────────────────────────────
 function removeDailyTrigger() {
   try {
@@ -524,9 +704,13 @@ function removeDailyTrigger() {
     for (var i = 0; i < triggers.length; i++) {
       if (triggers[i].getHandlerFunction() === 'runFollowupDigest') {
         ScriptApp.deleteTrigger(triggers[i]);
-        Logger.log('Existing trigger removed.');
+        Logger.log('Trigger removed.');
       }
     }
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      'Daily trigger removed.',
+      '🗑️ Trigger Removed', 5
+    );
   } catch (e) {
     Logger.log('removeDailyTrigger ERROR: ' + e.message);
   }
@@ -552,9 +736,7 @@ function extractName(toField) {
   try {
     var match = toField.match(/^([^<]+)</);
     if (match) return match[1].trim();
-    // If no name found return email prefix
-    var email = extractEmail(toField);
-    return email.split('@')[0] || '';
+    return extractEmail(toField).split('@')[0] || '';
   } catch (e) {
     return '';
   }
