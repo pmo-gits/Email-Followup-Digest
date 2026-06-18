@@ -214,6 +214,8 @@ function fetchSentThreads(scanWindowDays, senderEmail) {
 
 // ─────────────────────────────────────────────
 // PROCESS THREADS — Filter No-Reply & Categorize
+// FIX 1: Check LAST message sender (not any message)
+// FIX 2: Days elapsed from YOUR last sent date
 // ─────────────────────────────────────────────
 function processThreads(threads, config) {
   try {
@@ -226,58 +228,68 @@ function processThreads(threads, config) {
       var thread = threads[i];
 
       try {
+        // Get FULL thread messages — both sent & received
         var messages = thread.getMessages();
         if (!messages || messages.length === 0) continue;
 
-        // Find the FIRST message sent by sender
-        var firstSentMsg = null;
+        // ── FIX 1: Check LAST message sender ──────────────────
+        // Last message tells us who the ball is with right now
+        var lastMessage = messages[messages.length - 1];
+        var lastMsgSender = lastMessage.getFrom().toLowerCase();
+
+        // If last message is NOT from sender → supplier replied last
+        // → No action needed → Skip this thread
+        if (lastMsgSender.indexOf(senderEmailLower) === -1) continue;
+
+        // ── FIX 2: Days elapsed from YOUR last sent date ───────
+        // Find the LAST message sent BY sender (not first)
+        // Because supplier clock resets every time you send new message
+        var lastSentByUs = null;
+        for (var m = messages.length - 1; m >= 0; m--) {
+          var fromEmail = messages[m].getFrom().toLowerCase();
+          if (fromEmail.indexOf(senderEmailLower) !== -1) {
+            lastSentByUs = messages[m];
+            break;
+          }
+        }
+        if (!lastSentByUs) continue;
+
+        // Calculate days elapsed from YOUR last sent date
+        var lastSentDate = lastSentByUs.getDate();
+        lastSentDate.setHours(0, 0, 0, 0);
+        var daysElapsed = Math.floor((today - lastSentDate) / (1000 * 60 * 60 * 24));
+
+        // Skip if sent today (0 days)
+        if (daysElapsed < 1) continue;
+
+        // Get recipient from first sent message by us
+        var firstSentByUs = null;
         for (var m = 0; m < messages.length; m++) {
           var fromEmail = messages[m].getFrom().toLowerCase();
           if (fromEmail.indexOf(senderEmailLower) !== -1) {
-            firstSentMsg = messages[m];
+            firstSentByUs = messages[m];
             break;
           }
         }
-        if (!firstSentMsg) continue;
+        if (!firstSentByUs) continue;
 
-        // Check if ANY reply exists from someone other than sender
-        var hasReply = false;
-        for (var m = 0; m < messages.length; m++) {
-          var fromEmail = messages[m].getFrom().toLowerCase();
-          if (fromEmail.indexOf(senderEmailLower) === -1) {
-            hasReply = true;
-            break;
-          }
-        }
-
-        // Skip thread if reply received
-        if (hasReply) continue;
-
-        // Calculate days elapsed from first sent date to today
-        var sentDate = firstSentMsg.getDate();
-        sentDate.setHours(0, 0, 0, 0);
-        var daysElapsed = Math.floor((today - sentDate) / (1000 * 60 * 60 * 24));
-
-        // Skip if 0 days (sent today)
-        if (daysElapsed < 1) continue;
-
-        // Assign category
+        // Assign category based on days elapsed
         var category = assignCategory(daysElapsed, config);
 
-        // Get recipient details
-        var toField = firstSentMsg.getTo();
+        // Get recipient details from first sent message
+        var toField = firstSentByUs.getTo();
         var recipientEmail = extractEmail(toField);
         var recipientName = extractName(toField);
 
         // Build Gmail thread link
-        var gmailLink = 'https://mail.google.com/mail/u/0/#sent/' + thread.getId();
+        var gmailLink = 'https://mail.google.com/mail/u/0/#all/' + thread.getId();
 
         // Build row as object — header name based
         var row = {
           'Recipient'      : recipientEmail,
           'Recipient Name' : recipientName,
           'Subject'        : thread.getFirstMessageSubject(),
-          'Sent Date'      : Utilities.formatDate(sentDate, Session.getScriptTimeZone(), 'dd-MMM-yyyy'),
+          'Sent Date'      : Utilities.formatDate(lastSentDate, Session.getScriptTimeZone(), 'dd-MMM-yyyy'),
           'Days Elapsed'   : daysElapsed,
           'Category'       : category,
           'Gmail Link'     : gmailLink
