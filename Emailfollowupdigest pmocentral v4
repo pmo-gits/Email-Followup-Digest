@@ -1,0 +1,478 @@
+/**
+ * ============================================================
+ * EMAIL FOLLOWUP DIGEST — PMO CENTRAL SCRIPT
+ * Project : Email Followup Digest
+ * Author  : Butler Leather - PMO
+ * Version : 4.3
+ * Script  : PMO Central — deployed ONCE as Web App
+ * Role    : Receives payload → writes to user sheet
+ * ============================================================
+ * WHAT'S NEW IN v4.3:
+ * - doPost now handles TWO actions:
+ *   action:'refresh' → merge Digest (existing behaviour)
+ *   action:'snooze'  → write snooze entries to Snooze_List
+ *                      + delete those rows from Digest
+ * - ALL sheet writes (Digest + Snooze_List) go through PMO
+ * - UserSheet never writes to Snooze_List directly
+ * - Consistent protection model — PMO bypasses both sheets
+ * ============================================================
+ * SETUP INSTRUCTIONS (ONE TIME ONLY BY PMO):
+ * 1. Paste this script in PMO master sheet Apps Script
+ * 2. Deploy as Web App
+ *    → Execute as  : Me (PMO)
+ *    → Access      : Anyone in organisation
+ * 3. Copy Web App URL → paste in each UserSheet CENTRAL_URL constant
+ * 4. Redeploy only when script changes
+ * ============================================================
+ */
+
+// ─────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────
+var SHEET_DIGEST      = 'Digest';
+var SHEET_SNOOZE_LIST = 'Snooze_List';
+var DATA_START_ROW    = 4;
+
+// Digest column positions (1-based)
+// Thread ID | Recipient | Recipient Name | Subject |
+// Sent Date | Days Elapsed | Category | Gmail Link |
+// Snooze | Remarks
+var COL_THREAD_ID      = 1;  // A
+var COL_RECIPIENT      = 2;  // B
+var COL_RECIPIENT_NAME = 3;  // C
+var COL_SUBJECT        = 4;  // D
+var COL_SENT_DATE      = 5;  // E
+var COL_DAYS_ELAPSED   = 6;  // F
+var COL_CATEGORY       = 7;  // G
+var COL_GMAIL_LINK     = 8;  // H
+var COL_SNOOZE         = 9;  // I
+var COL_REMARKS        = 10; // J
+var TOTAL_COLS         = 10;
+
+// ─────────────────────────────────────────────
+// WEB APP ENTRY POINT — doPost
+// Routes by action: 'refresh' or 'snooze'
+// ─────────────────────────────────────────────
+function doPost(e) {
+  try {
+    Logger.log('=== PMO Central v4.3 doPost received ===');
+
+    var payload = JSON.parse(e.postData.contents);
+    Logger.log('Action: ' + payload.action + ' | SheetId: ' + payload.sheetId);
+
+    if (!payload.sheetId) throw new Error('Sheet ID missing in payload.');
+    if (!payload.action)  throw new Error('Action missing in payload.');
+
+    var userSS = SpreadsheetApp.openById(payload.sheetId);
+
+    // ── Route by action ──
+    if (payload.action === 'snooze') {
+      return handleSnooze(userSS, payload);
+    } else if (payload.action === 'refresh') {
+      return handleRefresh(userSS, payload);
+    } else {
+      throw new Error('Unknown action: ' + payload.action);
+    }
+
+  } catch (e) {
+    Logger.log('doPost ERROR: ' + e.message);
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: 'error', message: e.message }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// ─────────────────────────────────────────────
+// HANDLE SNOOZE ACTION
+// 1. Append snooze entries to Snooze_List (PMO bypasses protection)
+// 2. Delete snoozed rows from Digest (bottom to top)
+// ─────────────────────────────────────────────
+function handleSnooze(userSS, payload) {
+  try {
+    Logger.log('=== handleSnooze started ===');
+
+    var snoozeEntries    = payload.snoozeEntries;    // array of {threadId, subject, recipient, snoozeTs, remarks}
+    var digestRowIndices = payload.digestRowIndices; // array of actual sheet row numbers to delete
+
+    if (!snoozeEntries || snoozeEntries.length === 0) {
+      throw new Error('No snooze entries in payload.');
+    }
+
+    var digestSheet = userSS.getSheetByName(SHEET_DIGEST);
+    var snoozeSheet = userSS.getSheetByName(SHEET_SNOOZE_LIST);
+
+    if (!digestSheet) throw new Error('Digest sheet not found.');
+    if (!snoozeSheet) throw new Error('Snooze_List sheet not found. Please create it manually.');
+
+    // Step 1: Append snooze entries to Snooze_List
+    var snoozeLastRow  = snoozeSheet.getLastRow();
+    var snoozeWriteRow = (snoozeLastRow < 1) ? 1 : snoozeLastRow + 1;
+
+    // Build 2D array for bulk write
+    var snoozeData = [];
+    for (var i = 0; i < snoozeEntries.length; i++) {
+      var e = snoozeEntries[i];
+      snoozeData.push([e.threadId, e.subject, e.recipient, e.snoozeTs, e.remarks]);
+    }
+
+    snoozeSheet
+      .getRange(snoozeWriteRow, 1, snoozeData.length, 5)
+      .setValues(snoozeData);
+
+    Logger.log('Snooze_List appended: ' + snoozeData.length + ' rows.');
+
+    // Step 2: Delete snoozed rows from Digest — bottom to top
+    if (digestRowIndices && digestRowIndices.length > 0) {
+      var sorted = digestRowIndices.slice().sort(function(a, b) { return b - a; });
+      for (var r = 0; r < sorted.length; r++) {
+        digestSheet.deleteRow(sorted[r]);
+      }
+      Logger.log('Digest rows deleted: ' + sorted.length);
+    }
+
+    Logger.log('=== handleSnooze completed ===');
+
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        status  : 'success',
+        message : snoozeEntries.length + ' entries snoozed successfully.'
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (e) {
+    Logger.log('handleSnooze ERROR: ' + e.message);
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: 'error', message: e.message }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// ─────────────────────────────────────────────
+// HANDLE REFRESH ACTION
+// Full merge operation on Digest
+// ─────────────────────────────────────────────
+function handleRefresh(userSS, payload) {
+  try {
+    Logger.log('=== handleRefresh started ===');
+
+    if (!payload.mergeResult) throw new Error('mergeResult missing in payload.');
+
+    var digestSheet = userSS.getSheetByName(SHEET_DIGEST);
+    if (!digestSheet) throw new Error('Digest sheet not found.');
+
+    var snoozeSheet = userSS.getSheetByName(SHEET_SNOOZE_LIST);
+    var mr          = payload.mergeResult;
+
+    // Step 1: DELETE rows no longer qualifying
+    deleteRemovedRows(digestSheet, mr.removedThreadIds);
+
+    // Step 2: UPDATE existing rows — script columns only, Remarks untouched
+    updateExistingRows(digestSheet, mr.updatedRows);
+
+    // Step 3: APPEND new rows
+    appendRows(digestSheet, mr.newRows);
+
+    // Step 4: APPEND snooze-return rows
+    appendRows(digestSheet, mr.snoozeReturnRows);
+
+    // Step 5: DELETE returned rows from Snooze_List
+    if (snoozeSheet && mr.snoozeRemovals && mr.snoozeRemovals.length > 0) {
+      deleteSnoozeListRows(snoozeSheet, mr.snoozeRemovals);
+    }
+
+    // Step 6: SORT by Days Elapsed ascending
+    sortByDaysElapsed(digestSheet);
+
+    // Step 7: Apply category color formatting
+    applyFullFormatting(digestSheet);
+
+    // Step 8: Ensure Snooze dropdown validation
+    ensureSnoozeDropdown(digestSheet);
+
+    // Step 9: Update meta row
+    var totalPending = countDataRows(digestSheet);
+    updateMetaRow(digestSheet, totalPending, payload.timestamp);
+
+    Logger.log('=== handleRefresh completed ===');
+
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        status  : 'success',
+        message : 'Digest updated successfully.',
+        total   : totalPending
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (e) {
+    Logger.log('handleRefresh ERROR: ' + e.message);
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: 'error', message: e.message }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// ─────────────────────────────────────────────
+// DELETE REMOVED ROWS — reply received threads
+// Bottom-to-top deletion — safe row shifting
+// ─────────────────────────────────────────────
+function deleteRemovedRows(digestSheet, removedThreadIds) {
+  try {
+    if (!removedThreadIds || removedThreadIds.length === 0) return;
+
+    var removeSet = {};
+    for (var i = 0; i < removedThreadIds.length; i++) {
+      removeSet[removedThreadIds[i].threadId] = true;
+    }
+
+    var lastRow = digestSheet.getLastRow();
+    if (lastRow < DATA_START_ROW) return;
+
+    var threadIds = digestSheet
+      .getRange(DATA_START_ROW, COL_THREAD_ID, lastRow - DATA_START_ROW + 1, 1)
+      .getValues();
+
+    var rowsToDelete = [];
+    for (var r = threadIds.length - 1; r >= 0; r--) {
+      if (removeSet[String(threadIds[r][0]).trim()]) {
+        rowsToDelete.push(DATA_START_ROW + r);
+      }
+    }
+
+    for (var d = 0; d < rowsToDelete.length; d++) {
+      digestSheet.deleteRow(rowsToDelete[d]);
+    }
+
+    Logger.log('Removed rows: ' + rowsToDelete.length);
+
+  } catch (e) {
+    Logger.log('deleteRemovedRows ERROR: ' + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// UPDATE EXISTING ROWS — BULK combined read + write
+// getValues()   → all columns including numbers/text
+// getFormulas() → Col H (Gmail Link) HYPERLINK formula
+// Merge both in memory → update script cols → setValues()
+// Col H formula preserved — not overwritten by plain text
+// Thread ID (A), Subject (D), Gmail Link (H), Remarks (J)
+// never touched. Refreshed: B, C, E, F, G
+// ─────────────────────────────────────────────
+function updateExistingRows(digestSheet, updatedRows) {
+  try {
+    if (!updatedRows || updatedRows.length === 0) return;
+
+    var lastRow = digestSheet.getLastRow();
+    if (lastRow < DATA_START_ROW) return;
+
+    var dataRows  = lastRow - DATA_START_ROW + 1;
+    var dataRange = digestSheet.getRange(DATA_START_ROW, 1, dataRows, TOTAL_COLS);
+
+    // Read values (numbers/text) AND formulas (for HYPERLINK col)
+    var data     = dataRange.getValues();
+    var formulas = dataRange.getFormulas();
+
+    // Inject Col H formulas into data array
+    // getValues() returns display text for formula cells — unusable
+    // getFormulas() returns the actual =HYPERLINK(...) string
+    for (var f = 0; f < data.length; f++) {
+      if (formulas[f][COL_GMAIL_LINK - 1]) {
+        data[f][COL_GMAIL_LINK - 1] = formulas[f][COL_GMAIL_LINK - 1];
+      }
+    }
+
+    // Build update map — Thread ID → row data
+    var updateMap = {};
+    for (var u = 0; u < updatedRows.length; u++) {
+      updateMap[updatedRows[u]['Thread ID']] = updatedRows[u];
+    }
+
+    // Update in memory — script-refresh cols only
+    var changed = false;
+    for (var r = 0; r < data.length; r++) {
+      var tid = String(data[r][COL_THREAD_ID - 1]).trim();
+      if (!tid || !updateMap[tid]) continue;
+
+      var upd = updateMap[tid];
+      data[r][COL_RECIPIENT - 1]      = upd['Recipient'];
+      data[r][COL_RECIPIENT_NAME - 1] = upd['Recipient Name'];
+      data[r][COL_SENT_DATE - 1]      = upd['Sent Date'];
+      data[r][COL_DAYS_ELAPSED - 1]   = upd['Days Elapsed'];
+      data[r][COL_CATEGORY - 1]       = upd['Category'];
+      // Col A (Thread ID)  — never touched
+      // Col D (Subject)    — write once, skip
+      // Col H (Gmail Link) — formula preserved from getFormulas()
+      // Col J (Remarks)    — user owned, never touched
+      changed = true;
+    }
+
+    // Single write back — formulas in Col H survive as strings
+    // setValues() with a formula string re-evaluates it correctly
+    if (changed) dataRange.setValues(data);
+
+    Logger.log('Updated rows (bulk): ' + updatedRows.length);
+
+  } catch (e) {
+    Logger.log('updateExistingRows ERROR: ' + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// APPEND ROWS — new & snooze-return rows
+// Appends at bottom — sort reorders correctly
+// ─────────────────────────────────────────────
+function appendRows(digestSheet, rows) {
+  try {
+    if (!rows || rows.length === 0) return;
+
+    var outputData = [];
+    for (var i = 0; i < rows.length; i++) {
+      var row      = rows[i];
+      var rowArray = new Array(TOTAL_COLS).fill('');
+
+      rowArray[COL_THREAD_ID - 1]      = row['Thread ID'];
+      rowArray[COL_RECIPIENT - 1]      = row['Recipient'];
+      rowArray[COL_RECIPIENT_NAME - 1] = row['Recipient Name'];
+      rowArray[COL_SUBJECT - 1]        = row['Subject'];
+      rowArray[COL_SENT_DATE - 1]      = row['Sent Date'];
+      rowArray[COL_DAYS_ELAPSED - 1]   = row['Days Elapsed'];
+      rowArray[COL_CATEGORY - 1]       = row['Category'];
+      rowArray[COL_GMAIL_LINK - 1]     = '=HYPERLINK("' + row['Gmail Link'] + '","🔗 Open Mail")';
+      rowArray[COL_SNOOZE - 1]         = '';
+      rowArray[COL_REMARKS - 1]        = row['Remarks'] || '';
+
+      outputData.push(rowArray);
+    }
+
+    var lastRow  = digestSheet.getLastRow();
+    var writeRow = (lastRow < DATA_START_ROW) ? DATA_START_ROW : lastRow + 1;
+    digestSheet.getRange(writeRow, 1, outputData.length, TOTAL_COLS).setValues(outputData);
+    digestSheet.getRange(writeRow, 1, outputData.length, TOTAL_COLS).setFontWeight('normal');
+
+    Logger.log('Appended rows: ' + outputData.length);
+
+  } catch (e) {
+    Logger.log('appendRows ERROR: ' + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// SORT BY DAYS ELAPSED — Ascending
+// Entire rows move — Remarks, Snooze preserved
+// ─────────────────────────────────────────────
+function sortByDaysElapsed(digestSheet) {
+  try {
+    var lastRow = digestSheet.getLastRow();
+    if (lastRow < DATA_START_ROW) return;
+
+    var dataRows  = lastRow - DATA_START_ROW + 1;
+    var sortRange = digestSheet.getRange(DATA_START_ROW, 1, dataRows, TOTAL_COLS);
+    sortRange.sort({ column: COL_DAYS_ELAPSED, ascending: true });
+
+    Logger.log('Sorted ascending: ' + dataRows + ' rows.');
+
+  } catch (e) {
+    Logger.log('sortByDaysElapsed ERROR: ' + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// DELETE SNOOZE LIST ROWS — returned threads
+// Bottom-to-top deletion
+// ─────────────────────────────────────────────
+function deleteSnoozeListRows(snoozeSheet, snoozeRemovals) {
+  try {
+    if (!snoozeRemovals || snoozeRemovals.length === 0) return;
+
+    var sorted = snoozeRemovals.slice().sort(function(a, b) { return b - a; });
+    for (var i = 0; i < sorted.length; i++) {
+      snoozeSheet.deleteRow(sorted[i]);
+    }
+
+    Logger.log('Snooze_List rows deleted: ' + sorted.length);
+
+  } catch (e) {
+    Logger.log('deleteSnoozeListRows ERROR: ' + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// APPLY FULL FORMATTING — Re-color entire Digest
+// ─────────────────────────────────────────────
+function applyFullFormatting(digestSheet) {
+  try {
+    var lastRow = digestSheet.getLastRow();
+    if (lastRow < DATA_START_ROW) return;
+
+    var dataRows   = lastRow - DATA_START_ROW + 1;
+    var categories = digestSheet
+      .getRange(DATA_START_ROW, COL_CATEGORY, dataRows, 1)
+      .getValues();
+
+    var colorMap = {
+      'Fresh'    : '#E6F4EA',
+      'Followup' : '#FFF9C4',
+      'Urgent'   : '#FFE0B2',
+      'Critical' : '#FFCDD2',
+      'Dead'     : '#EEEEEE'
+    };
+
+    for (var i = 0; i < categories.length; i++) {
+      var cat   = String(categories[i][0]).trim();
+      var color = colorMap[cat] || '#FFFFFF';
+      digestSheet
+        .getRange(DATA_START_ROW + i, 1, 1, TOTAL_COLS)
+        .setBackground(color);
+    }
+
+    Logger.log('Formatting applied: ' + dataRows + ' rows.');
+
+  } catch (e) {
+    Logger.log('applyFullFormatting ERROR: ' + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// ENSURE SNOOZE DROPDOWN — Col I from row 4
+// ─────────────────────────────────────────────
+function ensureSnoozeDropdown(digestSheet) {
+  try {
+    var lastRow     = Math.max(digestSheet.getLastRow(), DATA_START_ROW + 50);
+    var snoozeRange = digestSheet.getRange(DATA_START_ROW, COL_SNOOZE, lastRow - DATA_START_ROW + 1, 1);
+    var rule        = SpreadsheetApp.newDataValidation()
+      .requireValueInList(['Snooze'], true)
+      .setAllowInvalid(false)
+      .build();
+    snoozeRange.setDataValidation(rule);
+    Logger.log('Snooze dropdown set.');
+  } catch (e) {
+    Logger.log('ensureSnoozeDropdown ERROR: ' + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// COUNT DATA ROWS
+// ─────────────────────────────────────────────
+function countDataRows(digestSheet) {
+  try {
+    var lastRow = digestSheet.getLastRow();
+    return (lastRow >= DATA_START_ROW) ? lastRow - DATA_START_ROW + 1 : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// ─────────────────────────────────────────────
+// UPDATE META ROW — Last Updated & Total Pending
+// ─────────────────────────────────────────────
+function updateMetaRow(digestSheet, totalPending, timestamp) {
+  try {
+    digestSheet.getRange(1, 1).setValue('Last Updated:') .setFontWeight('bold');
+    digestSheet.getRange(1, 2).setValue(timestamp);
+    digestSheet.getRange(1, 3).setValue('Total Pending:').setFontWeight('bold');
+    digestSheet.getRange(1, 4).setValue(totalPending);
+    Logger.log('Meta row updated: ' + timestamp + ' | Pending: ' + totalPending);
+  } catch (e) {
+    Logger.log('updateMetaRow ERROR: ' + e.message);
+  }
+}
