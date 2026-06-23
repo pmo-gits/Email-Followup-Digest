@@ -1,0 +1,778 @@
+/**
+ * ============================================================
+ * EMAIL FOLLOWUP DIGEST — USER SHEET SCRIPT
+ * Project : Email Followup Digest
+ * Author  : Butler Leather - PMO
+ * Version : 4.3
+ * Script  : User Side — runs as each user
+ * Role    : Scan Gmail → Send data to PMO Central via doPost
+ * ============================================================
+ * WHAT'S NEW IN v4.3:
+ * - updateSnoozeList no longer writes directly to Snooze_List
+ * - Snooze entries sent to PMO Central via doPost (action: 'snooze')
+ * - PMO Central writes to protected Snooze_List — bypasses protection
+ * - Consistent pattern: ALL sheet writes go through PMO Central
+ * - getOrCreateSnoozeSheet removed — PMO owns Snooze_List tab
+ * ============================================================
+ * SETUP INSTRUCTIONS:
+ * 1. Paste this script in each user's copied sheet
+ * 2. Update Config tab → Sender Email only
+ * 3. Click menu → Setup Daily Trigger
+ * 4. No deployment needed in user sheet
+ * ============================================================
+ */
+
+// ─────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────
+var SHEET_DIGEST      = 'Digest';
+var SHEET_CONFIG      = 'Config';
+var SHEET_SNOOZE_LIST = 'Snooze_List';
+var DATA_START_ROW    = 4;
+var CENTRAL_URL       = 'https://script.google.com/macros/s/AKfycbxINb7Xqp87uemx1ptHtQ4a-ggDcTmcG1Lhdj3IJJwfXDW0t8E71mOkKvq2hp0hR4iaQg/exec';
+
+// ─────────────────────────────────────────────
+// COLUMN POSITIONS — Digest Tab (1-based)
+// Thread ID | Recipient | Recipient Name | Subject |
+// Sent Date | Days Elapsed | Category | Gmail Link |
+// Snooze | Remarks
+// ─────────────────────────────────────────────
+var COL_THREAD_ID      = 1;  // A — Script (once)
+var COL_RECIPIENT      = 2;  // B — Script (refresh)
+var COL_RECIPIENT_NAME = 3;  // C — Script (refresh)
+var COL_SUBJECT        = 4;  // D — Script (once)
+var COL_SENT_DATE      = 5;  // E — Script (refresh)
+var COL_DAYS_ELAPSED   = 6;  // F — Script (refresh)
+var COL_CATEGORY       = 7;  // G — Script (refresh)
+var COL_GMAIL_LINK     = 8;  // H — Script (once)
+var COL_SNOOZE         = 9;  // I — User (dropdown)
+var COL_REMARKS        = 10; // J — User (free text, never touched)
+
+// ─────────────────────────────────────────────
+// SNOOZE_LIST COLUMN POSITIONS (1-based)
+// Read-only from UserSheet — writes go via PMO Central
+// ─────────────────────────────────────────────
+var SCOL_THREAD_ID  = 1; // A
+var SCOL_SUBJECT    = 2; // B
+var SCOL_RECIPIENT  = 3; // C
+var SCOL_SNOOZED_ON = 4; // D
+var SCOL_REMARKS    = 5; // E
+
+// ─────────────────────────────────────────────
+// ON OPEN — Add Custom Menu
+// ─────────────────────────────────────────────
+function onOpen() {
+  try {
+    SpreadsheetApp.getUi()
+      .createMenu('📋 Followup Digest')
+      .addItem('🔄 Refresh Now',           'menuRefreshNow')
+      .addItem('💤 Update Snooze List',    'menuUpdateSnoozeList')
+      .addSeparator()
+      .addItem('ℹ️ Show Last Updated',     'menuShowLastUpdated')
+      .addSeparator()
+      .addItem('⚙️ Setup Daily Trigger',   'menuSetupTrigger')
+      .addItem('🗑️ Remove Daily Trigger', 'menuRemoveTrigger')
+      .addToUi();
+    Logger.log('Menu created successfully.');
+  } catch (e) {
+    Logger.log('onOpen error: ' + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// MENU WRAPPERS — Authorization check first
+// ─────────────────────────────────────────────
+function menuRefreshNow() {
+  if (!isAuthorizedWithAlert()) return;
+  runFollowupDigest();
+}
+
+function menuUpdateSnoozeList() {
+  if (!isAuthorizedWithAlert()) return;
+  updateSnoozeList();
+}
+
+function menuShowLastUpdated() {
+  if (!isAuthorizedWithAlert()) return;
+  showLastUpdated();
+}
+
+function menuSetupTrigger() {
+  if (!isAuthorizedWithAlert()) return;
+  setupDailyTrigger();
+}
+
+function menuRemoveTrigger() {
+  if (!isAuthorizedWithAlert()) return;
+  removeDailyTrigger();
+}
+
+// ─────────────────────────────────────────────
+// AUTHORIZATION CHECK
+// ─────────────────────────────────────────────
+function checkAuthorization() {
+  try {
+    var ss          = SpreadsheetApp.getActiveSpreadsheet();
+    var config      = readConfig(ss);
+    var senderEmail = config.senderEmail.toLowerCase().trim();
+    var currentUser = Session.getActiveUser().getEmail().toLowerCase().trim();
+
+    Logger.log('Auth — Current: ' + currentUser + ' | Config: ' + senderEmail);
+
+    if (currentUser === senderEmail) return { authorized: true };
+
+    return {
+      authorized : false,
+      message    : 'You are not authorized to run this script.' +
+                   '\n\nYour Email      : ' + currentUser +
+                   '\nAuthorized Email : ' + senderEmail
+    };
+  } catch (e) {
+    Logger.log('checkAuthorization ERROR: ' + e.message);
+    return { authorized: false, message: 'Authorization check failed: ' + e.message };
+  }
+}
+
+function isAuthorizedWithAlert() {
+  try {
+    var authResult = checkAuthorization();
+    if (!authResult.authorized) {
+      SpreadsheetApp.getUi().alert(
+        '🚫 Not Authorized',
+        authResult.message,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+      return false;
+    }
+    return true;
+  } catch (e) {
+    Logger.log('isAuthorizedWithAlert ERROR: ' + e.message);
+    SpreadsheetApp.getUi().alert(
+      '❌ Error',
+      'Authorization check failed: ' + e.message,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────
+// UPDATE SNOOZE LIST — Menu Button Action
+// Collects rows marked "Snooze" in Digest Col I
+// Sends snoozeEntries to PMO Central via doPost
+// PMO Central writes to protected Snooze_List
+// PMO Central deletes those rows from Digest
+// UserSheet never touches Snooze_List directly
+// ─────────────────────────────────────────────
+function updateSnoozeList() {
+  try {
+    Logger.log('=== Update Snooze List Started ===');
+
+    var ss          = SpreadsheetApp.getActiveSpreadsheet();
+    var digestSheet = ss.getSheetByName(SHEET_DIGEST);
+    if (!digestSheet) throw new Error('Digest sheet not found.');
+
+    var lastRow = digestSheet.getLastRow();
+    if (lastRow < DATA_START_ROW) {
+      SpreadsheetApp.getUi().alert(
+        '💤 Snooze Update',
+        'No data rows found in Digest.',
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+      return;
+    }
+
+    var data      = digestSheet.getRange(DATA_START_ROW, 1, lastRow - DATA_START_ROW + 1, COL_REMARKS).getValues();
+    var snoozeNow = new Date();
+    var snoozeTs  = Utilities.formatDate(snoozeNow, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+
+    var snoozeEntries    = []; // rows to add to Snooze_List
+    var digestRowIndices = []; // DATA_START_ROW-based indices to delete from Digest
+
+    for (var i = 0; i < data.length; i++) {
+      var snoozeVal = String(data[i][COL_SNOOZE - 1]).trim();
+      if (snoozeVal === 'Snooze') {
+        snoozeEntries.push({
+          threadId  : String(data[i][COL_THREAD_ID - 1]).trim(),
+          subject   : String(data[i][COL_SUBJECT - 1]).trim(),
+          recipient : String(data[i][COL_RECIPIENT - 1]).trim(),
+          snoozeTs  : snoozeTs,
+          remarks   : String(data[i][COL_REMARKS - 1]).trim()
+        });
+        digestRowIndices.push(DATA_START_ROW + i);
+      }
+    }
+
+    if (snoozeEntries.length === 0) {
+      SpreadsheetApp.getUi().alert(
+        '💤 Snooze Update',
+        'No rows marked as "Snooze" found.\n\nSelect "Snooze" in the Snooze column first.',
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+      return;
+    }
+
+    // Send to PMO Central — action: 'snooze'
+    sendSnoozeToCentral(ss.getId(), snoozeEntries, digestRowIndices, snoozeTs);
+
+    Logger.log('=== Update Snooze List Completed ===');
+
+  } catch (e) {
+    Logger.log('updateSnoozeList ERROR: ' + e.message);
+    SpreadsheetApp.getUi().alert('❌ Snooze Error', e.message, SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+// ─────────────────────────────────────────────
+// SEND SNOOZE TO CENTRAL — action: 'snooze'
+// Separate payload from refresh action
+// PMO Central handles Snooze_List write + Digest delete
+// ─────────────────────────────────────────────
+function sendSnoozeToCentral(sheetId, snoozeEntries, digestRowIndices, snoozeTs) {
+  try {
+    Logger.log('Sending snooze payload to PMO Central.');
+
+    var payload = {
+      action           : 'snooze',
+      sheetId          : sheetId,
+      snoozeEntries    : snoozeEntries,
+      digestRowIndices : digestRowIndices
+    };
+
+    var options = {
+      method            : 'post',
+      contentType       : 'application/json',
+      payload           : JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+
+    var response = UrlFetchApp.fetch(CENTRAL_URL, options);
+    var result   = JSON.parse(response.getContentText());
+
+    Logger.log('Central snooze response: ' + JSON.stringify(result));
+
+    if (result.status === 'success') {
+      SpreadsheetApp.getActiveSpreadsheet().toast(
+        snoozeEntries.length + ' email(s) moved to Snooze List.',
+        '✅ Snooze List Updated', 5
+      );
+    } else {
+      throw new Error('Central script error: ' + result.message);
+    }
+
+  } catch (e) {
+    Logger.log('sendSnoozeToCentral ERROR: ' + e.message);
+    throw e;
+  }
+}
+
+// ─────────────────────────────────────────────
+// MAIN FUNCTION — Run Followup Digest (MERGE)
+// ─────────────────────────────────────────────
+function runFollowupDigest() {
+  try {
+    Logger.log('=== Email Followup Digest v4.3 Started ===');
+
+    var ss     = SpreadsheetApp.getActiveSpreadsheet();
+    var config = readConfig(ss);
+    Logger.log('Config loaded: ' + JSON.stringify(config));
+
+    if (!CENTRAL_URL || CENTRAL_URL === '') {
+      throw new Error('Central URL is missing. Please update CENTRAL_URL constant.');
+    }
+
+    // Step 1: Read existing Digest → Thread ID map
+    var existingMap = readExistingDigest(ss);
+    Logger.log('Existing Digest rows: ' + Object.keys(existingMap).length);
+
+    // Step 2: Read Snooze_List → Thread ID map
+    var snoozeMap = readSnoozeList(ss);
+    Logger.log('Snoozed threads: ' + Object.keys(snoozeMap).length);
+
+    // Step 3: Fetch Gmail sent threads
+    var threads = fetchSentThreads(config.scanWindow, config.senderEmail);
+    Logger.log('Threads fetched: ' + threads.length);
+
+    // Step 4: Process threads → merge result
+    var mergeResult = processThreadsMerge(threads, config, existingMap, snoozeMap);
+    Logger.log('New: '      + mergeResult.newRows.length);
+    Logger.log('Updated: '  + mergeResult.updatedRows.length);
+    Logger.log('Returned: ' + mergeResult.snoozeReturnRows.length);
+    Logger.log('Removed: '  + mergeResult.removedThreadIds.length);
+    Logger.log('SnoozeRemovals: ' + mergeResult.snoozeRemovals.length);
+
+    // Step 5: Send merged payload to PMO Central — action: 'refresh'
+    sendRefreshToCentral(config, mergeResult, ss.getId());
+
+    Logger.log('=== Email Followup Digest v4.3 Completed ===');
+
+  } catch (e) {
+    Logger.log('runFollowupDigest ERROR: ' + e.message);
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      'Error: ' + e.message,
+      '❌ Followup Digest Failed', 10
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// SEND REFRESH TO CENTRAL — action: 'refresh'
+// ─────────────────────────────────────────────
+function sendRefreshToCentral(config, mergeResult, sheetId) {
+  try {
+    Logger.log('Sending refresh payload to PMO Central: ' + CENTRAL_URL);
+
+    var now       = new Date();
+    var timestamp = Utilities.formatDate(now, Session.getScriptTimeZone(), 'dd-MMM-yyyy hh:mm a');
+
+    var payload = {
+      action      : 'refresh',
+      sheetId     : sheetId,
+      mergeResult : mergeResult,
+      timestamp   : timestamp
+    };
+
+    var options = {
+      method            : 'post',
+      contentType       : 'application/json',
+      payload           : JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+
+    var response = UrlFetchApp.fetch(CENTRAL_URL, options);
+    var result   = JSON.parse(response.getContentText());
+
+    Logger.log('Central refresh response: ' + JSON.stringify(result));
+
+    if (result.status === 'success') {
+      SpreadsheetApp.getActiveSpreadsheet().toast(
+        'New: ' + mergeResult.newRows.length +
+        ' | Updated: ' + mergeResult.updatedRows.length +
+        ' | Returned: ' + mergeResult.snoozeReturnRows.length +
+        ' | Removed: ' + mergeResult.removedThreadIds.length,
+        '✅ Digest Refreshed', 7
+      );
+    } else {
+      throw new Error('Central script error: ' + result.message);
+    }
+
+  } catch (e) {
+    Logger.log('sendRefreshToCentral ERROR: ' + e.message);
+    throw e;
+  }
+}
+
+// ─────────────────────────────────────────────
+// READ EXISTING DIGEST — Thread ID map
+// Returns { threadId: { sheetRow, remarks } }
+// ─────────────────────────────────────────────
+function readExistingDigest(ss) {
+  try {
+    var digestSheet = ss.getSheetByName(SHEET_DIGEST);
+    if (!digestSheet) return {};
+
+    var lastRow = digestSheet.getLastRow();
+    if (lastRow < DATA_START_ROW) return {};
+
+    var data = digestSheet.getRange(
+      DATA_START_ROW, 1,
+      lastRow - DATA_START_ROW + 1,
+      COL_REMARKS
+    ).getValues();
+
+    var map = {};
+    for (var i = 0; i < data.length; i++) {
+      var threadId = String(data[i][COL_THREAD_ID - 1]).trim();
+      if (!threadId) continue;
+      map[threadId] = {
+        sheetRow : DATA_START_ROW + i,
+        remarks  : String(data[i][COL_REMARKS - 1])
+      };
+    }
+    return map;
+  } catch (e) {
+    Logger.log('readExistingDigest ERROR: ' + e.message);
+    return {};
+  }
+}
+
+// ─────────────────────────────────────────────
+// READ SNOOZE LIST — Thread ID map (READ ONLY)
+// UserSheet only reads — never writes to Snooze_List
+// Returns { threadId: { snoozeTs (Date), snoozeRow, remarks } }
+// ─────────────────────────────────────────────
+function readSnoozeList(ss) {
+  try {
+    var snoozeSheet = ss.getSheetByName(SHEET_SNOOZE_LIST);
+    if (!snoozeSheet) return {};
+
+    var lastRow = snoozeSheet.getLastRow();
+    if (lastRow < 2) return {};
+
+    var data = snoozeSheet.getRange(2, 1, lastRow - 1, 5).getValues();
+    var map  = {};
+
+    for (var i = 0; i < data.length; i++) {
+      var threadId  = String(data[i][SCOL_THREAD_ID - 1]).trim();
+      var snoozeStr = String(data[i][SCOL_SNOOZED_ON - 1]).trim();
+      var remarks   = String(data[i][SCOL_REMARKS - 1]);
+      if (!threadId) continue;
+
+      var snoozeTs = new Date(snoozeStr);
+      if (isNaN(snoozeTs.getTime())) {
+        Logger.log('Invalid snooze date skipped — threadId: ' + threadId + ' | value: ' + snoozeStr);
+        continue;
+      }
+      map[threadId] = {
+        snoozeTs  : snoozeTs,
+        snoozeRow : i + 2,
+        remarks   : remarks
+      };
+    }
+    return map;
+  } catch (e) {
+    Logger.log('readSnoozeList ERROR: ' + e.message);
+    return {};
+  }
+}
+
+// ─────────────────────────────────────────────
+// PROCESS THREADS — MERGE Logic
+// ─────────────────────────────────────────────
+function processThreadsMerge(threads, config, existingMap, snoozeMap) {
+  try {
+    var today            = new Date();
+    today.setHours(0, 0, 0, 0);
+    var senderEmailLower = config.senderEmail.toLowerCase();
+
+    var newRows          = [];
+    var updatedRows      = [];
+    var snoozeReturnRows = [];
+    var snoozeRemovals   = [];
+    var qualifiedIds     = {};
+
+    for (var i = 0; i < threads.length; i++) {
+      var thread = threads[i];
+
+      try {
+        var messages = thread.getMessages();
+        if (!messages || messages.length === 0) continue;
+
+        var lastMessage   = messages[messages.length - 1];
+        var lastMsgSender = lastMessage.getFrom().toLowerCase();
+        if (lastMsgSender.indexOf(senderEmailLower) === -1) continue;
+
+        var lastSentByUs = null;
+        for (var m = messages.length - 1; m >= 0; m--) {
+          if (messages[m].getFrom().toLowerCase().indexOf(senderEmailLower) !== -1) {
+            lastSentByUs = messages[m];
+            break;
+          }
+        }
+        if (!lastSentByUs) continue;
+
+        var lastSentDate = new Date(lastSentByUs.getDate());
+        lastSentDate.setHours(0, 0, 0, 0);
+        var daysElapsed = Math.floor((today - lastSentDate) / (1000 * 60 * 60 * 24));
+        if (daysElapsed < 1) continue;
+
+        var threadId       = thread.getId();
+        var category       = assignCategory(daysElapsed, config);
+        var toField        = lastSentByUs.getTo();
+        var recipientEmail = extractRecipients(toField);
+        var recipientName  = extractName(toField);
+        var gmailLink      = 'https://mail.google.com/mail/u/0/#all/' + threadId;
+        var sentDateStr    = Utilities.formatDate(lastSentDate, Session.getScriptTimeZone(), 'dd-MMM-yyyy');
+
+        qualifiedIds[threadId] = true;
+
+        var rowData = {
+          'Thread ID'      : threadId,
+          'Subject'        : thread.getFirstMessageSubject(),
+          'Sent Date'      : sentDateStr,
+          'Gmail Link'     : gmailLink,
+          'Recipient'      : recipientEmail,
+          'Recipient Name' : recipientName,
+          'Days Elapsed'   : daysElapsed,
+          'Category'       : category,
+          'Snooze'         : '',
+          'Remarks'        : ''
+        };
+
+        // CASE 1: Thread is in Snooze_List
+        if (snoozeMap[threadId]) {
+          var snoozeEntry  = snoozeMap[threadId];
+          var lastSentFull = lastSentByUs.getDate();
+
+          if (lastSentFull > snoozeEntry.snoozeTs) {
+            rowData['Remarks'] = snoozeEntry.remarks;
+            snoozeReturnRows.push(rowData);
+            snoozeRemovals.push(snoozeEntry.snoozeRow);
+            Logger.log('Snooze return: ' + threadId);
+          }
+          continue;
+        }
+
+        // CASE 2: Thread exists in Digest
+        if (existingMap[threadId]) {
+          rowData['Remarks']  = existingMap[threadId].remarks;
+          rowData['sheetRow'] = existingMap[threadId].sheetRow;
+          updatedRows.push(rowData);
+          continue;
+        }
+
+        // CASE 3: Brand new thread
+        newRows.push(rowData);
+
+      } catch (threadErr) {
+        Logger.log('Thread skipped: ' + threadErr.message);
+        continue;
+      }
+    }
+
+    // Threads in Digest no longer qualifying
+    var removedThreadIds = [];
+    for (var tid in existingMap) {
+      if (!qualifiedIds[tid]) {
+        removedThreadIds.push({ threadId: tid, sheetRow: existingMap[tid].sheetRow });
+      }
+    }
+
+    return {
+      newRows          : newRows,
+      updatedRows      : updatedRows,
+      snoozeReturnRows : snoozeReturnRows,
+      removedThreadIds : removedThreadIds,
+      snoozeRemovals   : snoozeRemovals
+    };
+
+  } catch (e) {
+    Logger.log('processThreadsMerge ERROR: ' + e.message);
+    throw e;
+  }
+}
+
+// ─────────────────────────────────────────────
+// READ CONFIG TAB
+// ─────────────────────────────────────────────
+function readConfig(ss) {
+  try {
+    var configSheet = ss.getSheetByName(SHEET_CONFIG);
+    if (!configSheet) throw new Error('Config sheet not found.');
+
+    var data      = configSheet.getDataRange().getValues();
+    var configMap = {};
+    for (var i = 1; i < data.length; i++) {
+      var key   = String(data[i][0]).trim();
+      var value = String(data[i][1]).trim();
+      if (key) configMap[key] = value;
+    }
+
+    var config = {
+      scanWindow  : parseInt(configMap['Scan Window (days)']) || 30,
+      triggerTime : configMap['Trigger Time']  || '8:00 AM',
+      senderEmail : configMap['Sender Email']  || Session.getActiveUser().getEmail(),
+      freshMax    : parseRangeMax(configMap['Fresh Range'],    2),
+      followupMax : parseRangeMax(configMap['Followup Range'], 5),
+      urgentMax   : parseRangeMax(configMap['Urgent Range'],   10),
+      criticalMax : parseRangeMax(configMap['Critical Range'], 20)
+    };
+
+    config.freshMin    = 1;
+    config.followupMin = config.freshMax    + 1;
+    config.urgentMin   = config.followupMax + 1;
+    config.criticalMin = config.urgentMax   + 1;
+    config.deadMin     = config.criticalMax + 1;
+
+    return config;
+
+  } catch (e) {
+    Logger.log('readConfig ERROR: ' + e.message);
+    throw e;
+  }
+}
+
+function parseRangeMax(rangeStr, defaultVal) {
+  try {
+    if (!rangeStr) return defaultVal;
+    var clean = rangeStr.replace(/days|day|\+/gi, '').trim();
+    var parts = clean.split('-');
+    if (parts.length === 2) return parseInt(parts[1].trim()) || defaultVal;
+    return parseInt(parts[0].trim()) || defaultVal;
+  } catch (e) {
+    return defaultVal;
+  }
+}
+
+// ─────────────────────────────────────────────
+// FETCH SENT THREADS — Bulk Gmail API
+// ─────────────────────────────────────────────
+function fetchSentThreads(scanWindowDays, senderEmail) {
+  try {
+    var cutoffDate    = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - scanWindowDays);
+    var formattedDate = Utilities.formatDate(cutoffDate, Session.getScriptTimeZone(), 'yyyy/MM/dd');
+    var query         = 'in:sent from:' + senderEmail + ' after:' + formattedDate;
+
+    Logger.log('Gmail Query: ' + query);
+
+    var threads   = [];
+    var start     = 0;
+    var batchSize = 100;
+
+    while (true) {
+      var batch = GmailApp.search(query, start, batchSize);
+      if (!batch || batch.length === 0) break;
+      threads = threads.concat(batch);
+      Logger.log('Batch: ' + batch.length + ' | Total: ' + threads.length);
+      if (batch.length < batchSize) break;
+      start += batchSize;
+    }
+
+    return threads;
+
+  } catch (e) {
+    Logger.log('fetchSentThreads ERROR: ' + e.message);
+    throw e;
+  }
+}
+
+// ─────────────────────────────────────────────
+// ASSIGN CATEGORY
+// ─────────────────────────────────────────────
+function assignCategory(days, config) {
+  if (days >= config.freshMin    && days <= config.freshMax)    return 'Fresh';
+  if (days >= config.followupMin && days <= config.followupMax) return 'Followup';
+  if (days >= config.urgentMin   && days <= config.urgentMax)   return 'Urgent';
+  if (days >= config.criticalMin && days <= config.criticalMax) return 'Critical';
+  if (days >= config.deadMin)                                    return 'Dead';
+  return 'Fresh';
+}
+
+// ─────────────────────────────────────────────
+// SHOW LAST UPDATED
+// ─────────────────────────────────────────────
+function showLastUpdated() {
+  try {
+    var ss          = SpreadsheetApp.getActiveSpreadsheet();
+    var digestSheet = ss.getSheetByName(SHEET_DIGEST);
+    var lastUpdated = digestSheet.getRange(1, 2).getValue();
+    var total       = digestSheet.getRange(1, 4).getValue();
+
+    SpreadsheetApp.getUi().alert(
+      'Email Followup Digest',
+      '🕒 Last Updated  : ' + lastUpdated +
+      '\n📋 Total Pending : ' + total,
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+  } catch (e) {
+    Logger.log('showLastUpdated ERROR: ' + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// SETUP DAILY TRIGGER
+// ─────────────────────────────────────────────
+function setupDailyTrigger() {
+  try {
+    removeDailyTrigger();
+
+    var ss          = SpreadsheetApp.getActiveSpreadsheet();
+    var config      = readConfig(ss);
+    var triggerHour = 8;
+
+    var timeStr   = config.triggerTime || '8:00 AM';
+    var timeParts = timeStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
+    if (timeParts) {
+      triggerHour = parseInt(timeParts[1]);
+      if (timeParts[3].toUpperCase() === 'PM' && triggerHour !== 12) triggerHour += 12;
+      if (timeParts[3].toUpperCase() === 'AM' && triggerHour === 12) triggerHour = 0;
+    }
+
+    ScriptApp.newTrigger('runFollowupDigest')
+      .timeBased()
+      .everyDays(1)
+      .atHour(triggerHour)
+      .create();
+
+    Logger.log('Trigger set at hour: ' + triggerHour);
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      'Daily trigger set at ' + config.triggerTime,
+      '✅ Trigger Setup Done', 5
+    );
+
+  } catch (e) {
+    Logger.log('setupDailyTrigger ERROR: ' + e.message);
+    SpreadsheetApp.getUi().alert('❌ Trigger Error', e.message, SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+// ─────────────────────────────────────────────
+// REMOVE DAILY TRIGGER
+// ─────────────────────────────────────────────
+function removeDailyTrigger() {
+  try {
+    var triggers = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < triggers.length; i++) {
+      if (triggers[i].getHandlerFunction() === 'runFollowupDigest') {
+        ScriptApp.deleteTrigger(triggers[i]);
+        Logger.log('Trigger removed.');
+      }
+    }
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      'Daily trigger removed.',
+      '🗑️ Trigger Removed', 5
+    );
+  } catch (e) {
+    Logger.log('removeDailyTrigger ERROR: ' + e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// EXTRACT RECIPIENTS — Max 2 emails + count
+// ─────────────────────────────────────────────
+function extractRecipients(toField) {
+  try {
+    if (!toField) return '';
+    var parts  = toField.split(',');
+    var emails = [];
+
+    for (var i = 0; i < parts.length; i++) {
+      var part  = parts[i].trim();
+      var match = part.match(/<([^>]+)>/);
+      if (match) {
+        emails.push(match[1].trim());
+      } else if (part.indexOf('@') !== -1) {
+        emails.push(part.trim());
+      }
+    }
+
+    if (emails.length === 0) return toField.trim();
+    if (emails.length === 1) return emails[0];
+    if (emails.length === 2) return emails[0] + ', ' + emails[1];
+
+    var remaining = emails.length - 2;
+    return emails[0] + ', ' + emails[1] + ' +' + remaining + ' more';
+
+  } catch (e) {
+    Logger.log('extractRecipients ERROR: ' + e.message);
+    return toField || '';
+  }
+}
+
+// ─────────────────────────────────────────────
+// EXTRACT NAME — from last sent To field
+// ─────────────────────────────────────────────
+function extractName(toField) {
+  try {
+    if (!toField) return '';
+    var firstPart  = toField.split(',')[0].trim();
+    var match      = firstPart.match(/^([^<]+)</);
+    if (match) return match[1].trim();
+    var emailMatch = firstPart.match(/<([^>]+)>/);
+    if (emailMatch) return emailMatch[1].split('@')[0].trim();
+    return firstPart.split('@')[0].trim();
+  } catch (e) {
+    return '';
+  }
+}
